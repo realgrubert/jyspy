@@ -49,6 +49,9 @@ public class Main implements Runnable
 			final PrintWriter pwcon = new PrintWriter(console.getStandardStream());
 			final History history = new History(HISTORY_FILE);
 			
+			// for holder. might be a better way.
+			history.addLine("globals().update(__holder__)");
+			
 			// Send line to Server
 			final PrintWriter writer = new PrintWriter(sock.getOutputStream());
 			console.setEnterHandler(new Console.ZoneEnterHandler() {
