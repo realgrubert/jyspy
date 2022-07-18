@@ -1,0 +1,731 @@
+==== Server.java =====
+package jyspy;
+
+import java.io.BufferedReader;
+import java.io.DataOutputStream;
+import java.io.File;
+import java.io.IOException;
+import java.io.InputStreamReader;
+import java.net.ServerSocket;
+import java.net.Socket;
+import java.util.Map;
+import java.util.Properties;
+
+import org.python.util.InteractiveConsole;
+import org.python.util.InteractiveInterpreter;
+import org.python.util.PythonInterpreter;
+
+public class Server implements Runnable {
+	// Interpreter return values.
+	private static final char IR = (char)0x11; // DC1  
+	private static final char IRM = (char)0x12; // DC2 
+
+	// ===============================================================
+	private static Map<String,Object> pythonVariables = null;
+	private static int     serverPort = 2000;
+	private static boolean isDebug = false;
+	private static String startupMessage  = null;
+	private static String connectMessage  = null;
+	private static String shutdownMessage = null;
+
+	private Server() {}
+
+	public void run() {
+		ServerSocket socket = null;
+
+		try {
+			socket = new ServerSocket(serverPort);
+			final Socket sock = socket.accept();
+
+			if ( connectMessage != null ) {
+				System.err.println(connectMessage + sock.getInetAddress());	
+				System.err.flush();
+			}
+
+			Properties overrideProps = new Properties();
+			overrideProps.setProperty("python.security.respectJavaAccessibility", "false");
+
+			PythonInterpreter.initialize(System.getProperties(), overrideProps, new String[] { "" });
+			InteractiveInterpreter interpret = new InteractiveInterpreter();
+
+			if ( pythonVariables != null ){
+				for (String k : pythonVariables.keySet()){
+					interpret.set(k, pythonVariables.get(k));
+				}
+			}
+
+			DataOutputStream toClient = new DataOutputStream(sock.getOutputStream());
+			toClient.writeBytes(InteractiveConsole.getDefaultBanner());
+			toClient.write((int)IR ); 
+			toClient.flush();
+			interpret.setOut(toClient);
+			interpret.setErr(toClient);
+
+			BufferedReader in = new BufferedReader(new InputStreamReader(sock.getInputStream()));
+
+			final StringBuffer buffer = new StringBuffer(); // to support multi line commands.
+
+			while (sock.isConnected()) {
+				String line = null;
+				try {
+					line = in.readLine();
+				} catch (java.net.SocketException se){
+					break;
+				}
+				if ( line == null ){
+					break;
+				}
+				if ( line.length() == 0 ){  // blank line? new prompt!
+					toClient.write((int) IR );
+					toClient.flush();
+					continue;
+				}
+
+				if ( isDebug ) System.err.println("----- incoming Last:" + (int)line.substring(line.length()-1).toCharArray()[0]);
+
+				buffer.append(line + "\n"); 
+				String interpretMe = buffer.toString();
+				boolean more = interpret.runsource(interpretMe);
+				if ( more ){
+					toClient.write((int)IRM );
+				} else {
+					buffer.delete(0,buffer.length()-1);
+					toClient.write((int) IR );
+				}
+				toClient.flush();
+			}
+
+			if ( shutdownMessage != null ) {
+				System.err.println(shutdownMessage);
+				System.err.flush();
+			}
+
+		} catch (Exception e) {
+			e.printStackTrace();
+		} finally {
+			if ( socket != null && !socket.isClosed() ) {
+				try {
+					socket.close();
+				} catch (IOException e) {
+					if ( isDebug ) e.printStackTrace();
+				}
+			}
+		}
+	}
+
+
+	public static Thread activate(
+			Integer serverPort,
+			Map<String,Object> pyVars, 
+			String pythonHome, 
+			String pythonPath, 
+			String threadName, 
+			String startupMessage, 
+			String connectMessage, 
+			String shutdownMessage,  
+			Boolean debug){
+
+		Server.pythonVariables = pyVars;
+		Server.connectMessage = connectMessage;
+		Server.shutdownMessage = shutdownMessage;
+
+		if ( serverPort != null ) {
+			Server.serverPort = serverPort.intValue();
+		}
+
+		if ( debug != null ) {
+			isDebug = debug.booleanValue();
+		}
+
+		if ( pythonHome != null ) {
+			if (! (new File(pythonHome)).exists() )
+				throw new RuntimeException("pythonHome " + pythonHome + " not found.");
+			System.getProperties().put("python.home", pythonHome );
+		}
+
+		if ( pythonPath != null ){
+			if (! (new File(pythonPath)).exists() )
+				throw new RuntimeException("pythonPath " + pythonPath + " not found.");
+			System.getProperties().put("python.path",pythonPath);
+		}
+
+		Server serv = new Server();
+
+		Thread jyspyThread = new Thread(serv);
+		if ( threadName != null ) {
+			jyspyThread.setName(threadName);
+		}
+
+		jyspyThread.start();
+
+		if (startupMessage != null) {
+			System.out.println(startupMessage);
+			System.out.flush();
+		}
+
+		return jyspyThread;
+	}
+
+
+	/**
+	 * for testing only  
+	 */
+	public static void main(String[] args) throws Exception {
+
+		Thread sthread = activate(null, null, null, null, 
+				"JySpy Thread",
+				"JySpy Server Running",
+				"JySpy connected ",
+				"JySpy Shutdown",
+				true);
+
+		try {
+			while (sthread.isAlive()){
+				Thread.sleep(1600);
+			}
+		} catch (InterruptedException e) {
+			e.printStackTrace();
+		}
+	}
+}
+
+=== CLIENT ===== 
+=== Main.java ===
+package jyspy;
+
+import java.awt.event.ActionEvent;
+import java.awt.event.KeyEvent;
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
+import java.io.PrintWriter;
+import java.net.Socket;
+
+import javax.swing.JFrame;
+import javax.swing.JScrollPane;
+import javax.swing.KeyStroke;
+import javax.swing.WindowConstants;
+import javax.swing.text.Keymap;
+import javax.swing.text.TextAction;
+
+public class Main implements Runnable
+{
+	static int PORT = 8125; 
+	static String HOST = "localhost"; // name or IP address of the target machine
+	// history also useful to copy/paste commands.. if not the output :)
+	static String HISTORY_FILE = "./jyspy.history"; 
+	
+	static String PROMPT = ">>>";
+	static String PROCESS = "...";
+	
+	// Interpreter return values.
+	static final char IR = (char)0x11; // DC1  
+	static final char IRM = (char)0x12; // DC2 
+
+	public static void activate() {
+		(new Thread(new Main())).start();
+	}
+
+	
+	public void run() {
+		try {
+
+			final Socket sock = new Socket(HOST, PORT);
+
+			JFrame frame = new JFrame();
+			frame.setTitle("JySpy Client connected to " + sock.getInetAddress());
+			frame.setSize(600, 400);
+			frame.setDefaultCloseOperation(WindowConstants.EXIT_ON_CLOSE);
+
+			final Console console = new Console(PROMPT);
+			
+			frame.getContentPane().add(new JScrollPane(console.getTextPane()));
+			final PrintWriter pwcon = new PrintWriter(console.getStandardStream());
+			final History history = new History(HISTORY_FILE);
+			
+			// for holder. might be a better way.
+			history.addLine("globals().update(__holder__)");
+			
+			// Send line to Server
+			final PrintWriter writer = new PrintWriter(sock.getOutputStream());
+			console.setEnterHandler(new Console.ZoneEnterHandler() {
+				public void handle(String line) {
+					history.addLine(line);
+					writer.println(line);
+					writer.flush();
+				}
+			});
+
+			Keymap keymap = console.getTextPane().getKeymap();
+			keymap.addActionForKeyStroke(KeyStroke.getKeyStroke((char) KeyEvent.VK_UP, 0),
+					(new TextAction("console.up") {
+						public void actionPerformed(ActionEvent event) {
+							history.move(false);
+							console.zoneSet(history.getLine());
+
+						}
+					}));
+
+			keymap.addActionForKeyStroke(KeyStroke.getKeyStroke((char) KeyEvent.VK_DOWN, 0), (new TextAction(
+					"console.down") {
+				public void actionPerformed(ActionEvent event) {
+					history.move(true);
+					console.zoneSet(history.getLine());
+				}
+			}));
+			frame.setVisible(true);
+			
+			BufferedReader in = new BufferedReader(new InputStreamReader(
+                    sock.getInputStream()));
+
+			while (sock.isConnected()) {
+				int c = in.read();
+				if ( c == -1 ){
+					System.err.println("End of Stream"); // not expected.
+					break;
+				}
+				switch (c)
+				{
+				case (int)IR:
+					console.zonePrompt(PROMPT);	
+					console.zoneReset();
+					break;
+				case ((int)IRM):
+					console.zonePrompt(PROCESS);
+					console.zoneReset();
+					break;
+				default:
+					pwcon.write(c);
+				    pwcon.flush();
+				}
+			}
+			
+		} catch (Exception e) {
+			System.err.println("Unable to start JySpy");
+			e.printStackTrace();
+			System.err.flush();
+		}
+		System.exit(-1);
+	}
+
+	public static void main(String[] args) throws Exception {
+		(new Main()).run();
+	}
+
+}
+=== Console.java ===
+package jyspy;
+
+import java.awt.Color;
+import java.awt.Font;
+import java.awt.event.ActionEvent;
+import java.awt.event.InputEvent;
+import java.awt.event.KeyAdapter;
+import java.awt.event.KeyEvent;
+import java.io.IOException;
+import java.io.OutputStream;
+import java.io.PrintStream;
+
+import javax.swing.JTextPane;
+import javax.swing.KeyStroke;
+import javax.swing.SwingUtilities;
+import javax.swing.text.BadLocationException;
+import javax.swing.text.Document;
+import javax.swing.text.JTextComponent;
+import javax.swing.text.Keymap;
+import javax.swing.text.SimpleAttributeSet;
+import javax.swing.text.StyleConstants;
+import javax.swing.text.TextAction;
+
+public class Console {
+	private static final Color COLOR_STDERR = Color.red;
+	private static final Color COLOR_STDOUT = Color.blue;
+	private static final Color COLOR_ZONE = Color.black;
+	private static final Color COLOR_BACK = Color.white;
+	
+	private static SimpleAttributeSet SAS_ZONE = new SimpleAttributeSet();
+	private static SimpleAttributeSet SAS_STDOUT = new SimpleAttributeSet();
+	private static SimpleAttributeSet SAS_STDERR = new SimpleAttributeSet();
+	
+	static {
+		SAS_ZONE.addAttribute(StyleConstants.Foreground, COLOR_ZONE);	
+		SAS_STDOUT.addAttribute(StyleConstants.Foreground, COLOR_STDOUT);	
+		SAS_STDERR.addAttribute(StyleConstants.Foreground, COLOR_STDERR);	
+	}
+	
+	private static final Font FONT = new Font("Monospaced", Font.PLAIN, 11);
+	
+	private InterruptHandler interruptHandler;
+	private ZoneEnterHandler zoneSubmitHandler;
+	
+	private PrintStream stdStream;
+	private PrintStream errStream;
+	
+	private JTextPane tpane = new JTextPane();
+	private Document doc;
+	private String prompt = "";
+	
+	private String zoneText;
+	private int zoneDocIdx = 0;
+	
+	
+	public Console(String prompt) throws Exception {
+		if ( prompt == null || prompt.length() == 0){
+			throw new IllegalArgumentException("prompt must be a non-empty string.");
+		}
+		this.prompt = prompt;
+		
+		stdStream = new PrintStream(new OutputStream() {
+			public void write(int b) throws IOException {
+				try {
+					doc.insertString(doc.getLength(), String.valueOf((char) b), SAS_STDOUT);
+				} catch (BadLocationException e) { e.printStackTrace(); }
+			}
+		});
+		
+		errStream = new PrintStream(new OutputStream() {
+			public void write(int b) throws IOException {
+				try {
+					doc.insertString(doc.getLength(), String.valueOf((char) b), SAS_STDERR);
+				} catch (BadLocationException e) { e.printStackTrace(); }
+			}
+		});
+		
+		tpane.addKeyListener(new KeyAdapter() {
+			
+			public void keyTyped(KeyEvent e) {
+				if (tpane.getCaretPosition() < zoneDocIdx) {
+					zoneFocus(); 
+					e.consume();
+				}
+			}
+		
+			public void keyPressed(KeyEvent e) {
+				// if not in zone, don't allow backspace
+				if (e.getKeyCode() == KeyEvent.VK_BACK_SPACE) {
+					if (tpane.getCaretPosition() <= zoneDocIdx) {
+						e.consume();
+						return;
+					}
+				}
+				// if in zone, go to start of edit zone, *after* the prompt.
+				if (e.getKeyCode() == KeyEvent.VK_HOME){
+					
+					if (tpane.getCaretPosition() >= zoneDocIdx) {
+						tpane.setCaretPosition(zoneDocIdx);
+						e.consume();
+						return;
+					}
+					
+				}
+				if (e.getKeyCode() == KeyEvent.VK_ENTER) {
+					// if the caret is outside the zone, go to zone, return.
+					if (tpane.getCaretPosition() < zoneDocIdx) {
+						zoneFocus();
+						e.consume();
+						return;
+					}
+					// if the caret is not at end of zone, move it there to avoid inserting CR/LF in zone text.
+					if ( tpane.getCaretPosition() < doc.getLength()){
+						tpane.setCaretPosition(doc.getLength()); 
+					}
+					// grab zone text.
+					try {
+							zoneText = doc.getText(zoneDocIdx, doc.getLength()
+									- zoneDocIdx);
+						} catch (BadLocationException e1) {
+							e1.printStackTrace();
+							zoneText = "";
+						}
+					}
+				
+				if (e.getKeyCode() == KeyEvent.VK_F12 ){
+					zoneReset();
+				}
+			}
+		});
+		
+		Keymap keymap = JTextComponent.addKeymap("console", tpane.getKeymap());
+		String os_name = System.getProperty("os.name");
+		
+		int interrupt_key = os_name.matches("^Win.*") ? KeyEvent.VK_PAUSE
+				: KeyEvent.VK_C; // BREAK
+		keymap.addActionForKeyStroke(KeyStroke.getKeyStroke(
+				(char) KeyEvent.VK_ENTER), (new TextAction("console.enter"){
+			public void actionPerformed(ActionEvent e) {
+				if (zoneSubmitHandler != null) {
+					zoneSubmitHandler.handle(zoneText);
+					//zoneReset();  // GIR - remove to eliminate double-prompt bug. called in the main socket loop. 
+				}
+				// try this to preserve the zone if enter pressed somewhere before the last position.
+				tpane.setCaretPosition(doc.getLength());
+				
+			}
+		}));
+		keymap.addActionForKeyStroke(KeyStroke.getKeyStroke(
+				(char) interrupt_key, InputEvent.CTRL_MASK), (new TextAction("console.keyboardInterrupt"){
+			public void actionPerformed(ActionEvent event) {
+				if (interruptHandler != null) {
+					interruptHandler.handle();
+				}
+			}
+		}));
+		
+		tpane.setKeymap(keymap);
+		
+		
+		tpane.setForeground(COLOR_ZONE);  // will be used whenever a keystroke can actually write, i.e.: in the zone.
+		tpane.setBackground(COLOR_BACK);
+		tpane.setFont(FONT);
+		tpane.requestFocus();
+		doc = tpane.getDocument();
+	}
+	
+	/* ==================== HANDLE THIS ========================================= */
+	public interface InterruptHandler {
+		public void handle();
+	}
+	
+	public void setInterruptHandler(InterruptHandler handler) {
+		this.interruptHandler = handler;
+	}
+
+	/* ------------------------------------------------- */
+
+	public interface ZoneEnterHandler {
+		/**
+		 * should return only after response is sent to our stream(s).
+		 * @param the stuff.
+		 */
+		public void handle(String line);
+	}
+	
+	public void setEnterHandler(ZoneEnterHandler zsHandler) {
+		this.zoneSubmitHandler = zsHandler;
+	}
+	
+	/* ====================================================================== */
+	
+	public JTextPane getTextPane() {
+		return this.tpane;
+	}
+
+	public PrintStream getStandardStream() {
+		return this.stdStream;
+	}
+
+	public PrintStream getErrorStream() {
+		return this.errStream;
+	}
+	/* ======= Editing Zone =========================================================== */
+	
+	/**
+	 *  move to new line
+	 *  write the prompt
+	 *  set the zoneDocIdx to the end of prompt.
+	 */
+	public void zoneReset() {
+		try {
+			if (! doc.getText(doc.getLength()-1, 1).equals("\n")) {
+				doc.insertString(doc.getLength(), "\n", SAS_ZONE);
+			}
+			doc.insertString(doc.getLength(), prompt + " ", SAS_ZONE);	
+			tpane.setCaretPosition(doc.getLength());
+			zoneDocIdx = doc.getLength();
+			zoneFocus();
+		} catch (BadLocationException e) {
+			e.printStackTrace();
+		}
+	}
+	/**
+	 * set the Prompt for the Edit Zone.
+	 * @param prompt
+	 */
+	public void zonePrompt(String prompt){
+		if ( prompt == null || prompt.length() == 0){
+			throw new IllegalArgumentException("prompt must be a non-emtpy string.");
+		}
+		this.prompt = prompt;
+	}
+	/**
+	 * overwrite the text in the current edit zone.
+	 * do not use async with the stream
+	 *  * @param zone contents.
+	 */
+	public void zoneSet(String newZone) {
+		newZone = newZone==null?"":newZone;
+		try {
+		if ( zoneDocIdx < doc.getLength()){
+			doc.remove(zoneDocIdx, doc.getLength()-zoneDocIdx);
+		}
+		
+		doc.insertString(zoneDocIdx, newZone, null);
+		zoneFocus();
+		} catch (BadLocationException e) {
+			e.printStackTrace();
+		}
+	}
+	/**
+	 * put the cursor at the end of the Edit Zone
+	 */
+	public void zoneFocus(){
+		final Console me = this;
+		SwingUtilities.invokeLater(new Runnable(){
+			public void run() {
+				me.tpane.setCaretPosition(doc.getLength());
+			}
+		});
+	}
+}
+=== History.java ===
+package jyspy;
+
+import java.io.File;
+import java.io.FileNotFoundException;
+import java.io.FileOutputStream;
+import java.io.FileReader;
+import java.io.IOException;
+import java.io.LineNumberReader;
+import java.io.PrintWriter;
+import java.util.ArrayList;
+
+public class History {
+	private int idx = 0; // may == linez.size() for "nothing" state.
+	private ArrayList<String> linez = new ArrayList<String>();
+	
+	public History(String historyPath) throws IOException{
+		File f = new File(historyPath);
+		if ( f.exists()){
+			String line = null;
+			LineNumberReader lnr = new LineNumberReader(new FileReader(historyPath));
+			while (( line = lnr.readLine() ) != null ){
+				linez.add(line);
+			}
+			lnr.close();
+		}
+		pw = new PrintWriter(new FileOutputStream(new File(historyPath),true));
+	}
+	
+	public PrintWriter pw = null;
+	
+	public void move(boolean forward) {
+		if (linez.size() == 0) {
+			return;
+		}
+		idx += forward ? 1 : -1;// adjust index.
+		idx = Math.min(Math.max(idx, 0), linez.size());
+	}
+	
+	public String getLine(){
+		if (idx == linez.size()) return null;
+		return (String)linez.get(idx);
+	}
+	
+	public void addLine(String line){
+		if ( line == null || line.length() == 0 ) return;
+		if ( linez.size()>0 && line.equals(linez.get(linez.size()-1))) return;  // don't store double entries twice. 
+		if ( pw != null ){
+			pw.println(line);
+			pw.flush();
+		}
+		linez.add(line);
+		idx = linez.size();
+	}
+	
+	public void writeOut(PrintWriter pw){
+		for ( int i = 0; i< linez.size(); i++){
+			pw.println(linez.get(i));
+		}
+		
+	}
+}
+==== JStub.java =====
+
+package WHEREEVER;
+/*
+ *   python.path = "C:/usr/workspace/Jython/src"  // where to find source files.
+ *   python.home = "C:/usr/jython2.5.1"  // where the standard library lives, etc. cachedir goes here.
+ *
+ *   pythonHome - where the standard library lives, etc. cachedir goes here.
+ *   required if we build this with a stripped-down Jython jar, but
+ *   if we use a "standalone" jar, as the new JySpy8 does, then it's not needed.
+ *   ( not sure where cachedir is put for the standalone jar.. will see :) )
+ *
+ *
+ */
+
+import java.lang.reflect.Method;
+import java.util.HashMap;
+import java.util.Map;
+
+public class JStub {
+
+    static Integer serverPort;
+    static String pythonHome = null;
+    static String pythonPath = null;
+    static String threadName = "JySpyThread";
+    static String startupMessage = "JySpy Has Cheezburgher";
+    static String connectMessage = "JySpy client connected:";
+    static String shutdownMessage = "JySpy server shutdown";
+    static Boolean debug = false;
+
+    // set to different class to access it's classloaders classes, if there are multiple classloaders
+    static Class classloaderClass = JStub.class;
+
+    static HashMap<String, Object> pythonVariables = new HashMap<String, Object>();
+
+    public static void add(String name, Object value) {
+        pythonVariables.put(name, value);
+    }
+
+    /**
+     * @return - JySpy server thread if for some reason you need it.
+     */
+    public static Thread start() {
+        try {
+
+            Class jss = classloaderClass.getClassLoader().loadClass("jyspy.Server");
+
+            /******* parameters. *******
+             Integer serverPort,
+             Map<String,Object> pyVars,
+             String pythonHome,
+             String pythonPath,
+             String threadName,
+             String startupMessage,
+             String connectMessage,
+             String shutdownMessage,
+             Boolean debug) */
+            Class[] parameterTypes = new Class[]{
+                    Integer.class,
+                    Map.class,
+                    String.class,
+                    String.class,
+                    String.class,
+                    String.class,
+                    String.class,
+                    String.class,
+                    Boolean.class};
+
+            Method m = jss.getMethod("activate", parameterTypes);
+
+            Object[] parameters = {
+                    serverPort,
+                    pythonVariables,
+                    pythonHome,
+                    pythonPath,
+                    threadName,
+                    startupMessage,
+                    connectMessage,
+                    shutdownMessage,
+                    debug};
+
+            return (Thread) m.invoke(null, parameters);
+
+        } catch (Exception e) {
+            e.printStackTrace();
+            return null;
+        }
+    }
+}
+
+
